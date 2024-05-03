@@ -5,10 +5,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_CXX_STANDARD 20)
-#if (APPLE) # Specify ARM and Neon flags for Apple Silicon
-#    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+simd -O3")
-#endif ()
-
 add_executable(${PROJECT_NAME}
         src/main.cc
         src/thread_pool.h
@@ -22,3 +18,10 @@ if (supported)
 else ()
     message(WARNING "IPO / LTO not supported: <${error}>")
 endif ()
+
+# Enable SSE2 instructions
+include(CheckCXXCompilerFlag)
+CHECK_CXX_COMPILER_FLAG("-msse2" COMPILER_SUPPORTS_SSE2)
+if(COMPILER_SUPPORTS_SSE2)
+    target_compile_options(${PROJECT_NAME} PRIVATE -msse2)
+endif()

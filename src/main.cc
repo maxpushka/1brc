@@ -1,5 +1,4 @@
 #include <iostream>
-#include <map>
 #include <memory>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -8,8 +7,13 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <condition_variable>
 #include <iomanip>
+
+#include <immintrin.h>
+#include <emmintrin.h>
+#include <smmintrin.h>
+#include <vector>
+#include <string>
 
 #include "thread_pool.h"
 
@@ -111,21 +115,62 @@ void process_line(const std::string &line) {
   it.sum += temperature;
 }
 
-void dispatch_rows(const char *data, const size_t size) {
+std::vector<std::string_view> split_by_rows_naive(const char *data, const size_t size) {
+  std::vector<std::string_view> result;
+    
   size_t start = 0;
   for (size_t i = 0; i < size; ++i) {
     if (data[i] == '\n') {
-      std::string line(data + start, i - start);
-      pool.enqueue([line] { process_line(line); });
+      result.emplace_back(data + start, i - start);
       start = i + 1;
     }
   }
 
   // Handle the last substring
   if (start < size) {
-    std::string line(data + start, size - start);
-    pool.enqueue([line] { process_line(line); });
+    result.emplace_back(data + start, size - start);
   }
+
+  return result;
+}
+
+std::vector<std::string_view> split_by_rows_sse2(const char* data, size_t size) {
+    std::vector<std::string_view> result;
+    const char* start = data;
+    __m128i newline = _mm_set1_epi8('\n');
+    
+    // Process 16 bytes at a time
+    while (size >= 16) {
+        __m128i block = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data));
+        int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline));
+        
+        while (mask != 0) {
+            int bit = _tzcnt_u32(mask); // Find the first set bit
+            result.emplace_back(start, data + bit); // Create a string from start to the newline
+            start = data + bit + 1; // Move start to after the newline
+            mask &= mask - 1; // Clear the lowest set bit
+        }
+        
+        data += 16;
+        size -= 16;
+    }
+    
+    // Handle any remaining characters
+    while (size > 0) {
+        if (*data == '\n') {
+            result.emplace_back(start, data);
+            start = data + 1;
+        }
+        data++;
+        size--;
+    }
+    
+    // Add the last piece if there's no newline at the end
+    if (start != data) {
+        result.emplace_back(start, data);
+    }
+    
+    return result;
 }
 }
 
@@ -150,7 +195,9 @@ int main(int argc, char *argv[]) {
 
   try {
     MappedFile file(argv[1]);
-    dispatch_rows(reinterpret_cast<const char *>(file.data()), file.size());
+    // auto results = split_by_rows_naive(reinterpret_cast<const char *>(file.data()), file.size());
+    auto results = split_by_rows_sse2(reinterpret_cast<const char *>(file.data()), file.size());
+    std::cout << "SSE2 results: " << results.size() << std::endl << results.at(0) << std::endl;
   } catch (const std::exception &e) {
     std::cerr << e.what() << std::endl;
     return 1;
@@ -158,8 +205,8 @@ int main(int argc, char *argv[]) {
 
   pool.wait_until_empty();
 
-  std::cout << std::fixed << std::setprecision(2) << "{";
   size_t i = 0;
+  std::cout << std::fixed << std::setprecision(2) << "{";
   for (const auto &[station, data] : station_map) {
     std::cout << station << "=" << data.min << "/" << data.max << "/" << data.sum / static_cast<float>(data.count);
     if (i < station_map.size() - 1) std::cout << ", ";
