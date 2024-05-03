@@ -1,13 +1,15 @@
 #include <iostream>
+#include <map>
+#include <memory>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdexcept>
 #include <string>
-#include <queue>
 #include <thread>
 #include <condition_variable>
+#include <iomanip>
 
 #include "thread_pool.h"
 
@@ -74,45 +76,47 @@ struct StationData {
   float min = std::numeric_limits<float>::max();
   float max = std::numeric_limits<float>::min();
   uint count = 0;
-  float mean = 0;
+  float sum = 0;
+  std::shared_ptr<std::mutex> mtx = std::make_shared<std::mutex>();
+
+  StationData(float temperature) : min(temperature), max(temperature), count(1), sum(temperature) {}
 };
 
 thread_pool::ThreadPool pool(std::thread::hardware_concurrency());
-std::mutex mtx;
 std::unordered_map<std::string, StationData> station_map;
+std::mutex map_access_mutex;
 
 void process_line(const std::string &line) {
-  if (line.empty() || line[0] == '#') return;  // Skip empty lines and comments
-
-  size_t pos = line.find(';'); // Each entry follows
-  if (pos == std::string::npos) return; // Missing ';' in the line, invalid format
+  size_t pos = line.find(';');
+  // No need to check for missing ';'
+  // since the data is assumed to be well-formed
 
   std::string station = line.substr(0, pos);
   float temperature = std::stof(line.substr(pos + 1));
 
-  std::lock_guard<std::mutex> lock(mtx);
-
-  auto it = station_map.find(station);
-  if (it != station_map.end()) {
-    it->second.min = std::min(it->second.min, temperature);
-    it->second.max = std::max(it->second.max, temperature);
-    it->second.count++;
-    it->second.mean = (temperature - it->second.mean) / static_cast<float>(it->second.count);
-  } else {
-    // Insert a new station
-    StationData new_station_data = {
-        .min = temperature,
-        .max = temperature,
-        .count = 1,
-        .mean = temperature
-    };
-    station_map.emplace(station, new_station_data);
+  if (station_map.find(station) == station_map.end()) {
+    std::lock_guard<std::mutex> lock(map_access_mutex);
+    if (station_map.find(station) == station_map.end()) {
+      station_map.insert({station, std::move(StationData(temperature))});
+      return;
+    }
   }
+
+  std::lock_guard<std::mutex> lock(*station_map.at(station).mtx);
+
+  StationData &it = station_map.at(station);
+  it.min = std::min(it.min, temperature);
+  it.max = std::max(it.max, temperature);
+  it.count++;
+  it.sum += temperature;
 }
 
-void dispatch_rows(const char *data, size_t size) {
+void dispatch_rows(const std::string &path) {
+  MappedFile file(path);
+  const char *data = static_cast<const char *>(file.data());
+
   size_t start = 0;
-  for (size_t i = 0; i < size; ++i) {
+  for (size_t i = 0; i < file.size(); ++i) {
     if (data[i] == '\n') {
       std::string line(data + start, i - start);
       pool.enqueue([line] { process_line(line); });
@@ -121,8 +125,8 @@ void dispatch_rows(const char *data, size_t size) {
   }
 
   // Handle the last substring
-  if (start < size) {
-    std::string line(data + start, size - start);
+  if (start < file.size()) {
+    std::string line(data + start, file.size() - start);
     pool.enqueue([line] { process_line(line); });
   }
 }
@@ -133,7 +137,6 @@ void dispatch_rows(const char *data, size_t size) {
  *   - Use SIMD to search for '\n' in the data buffer
  *   - Pass `dispatch_rows` the start and end index of the data entry buffer instead of the entire buffer
  *   - Reduce contention
- *     - Use lock per station
  *     - Use a lock-free data structure to store the station data
  *   - Implement perfect hash function for station names to speed up lookups. Each station name is no longer than 100 bytes
  *   - Execute reduce operation on the station data in parallel. Use streaming.
@@ -144,18 +147,22 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // Reserve space for the map to avoid rehashing.
+  // Rehashing in concurrent environment can lead to SEGFAULT.
+  station_map.reserve(10000);
+
   try {
-    MappedFile file(argv[1]);
-    dispatch_rows(reinterpret_cast<char *>(file.data()), file.size());
+    dispatch_rows(argv[1]);
     pool.wait_until_empty();
 
+    std::cout << std::fixed << std::setprecision(2) << "{";
+    size_t i = 0;
     for (const auto &[station, data] : station_map) {
-      std::cout << station << ": " << "\n"
-                << "\tMin: " << data.min << "\n"
-                << "\tMax: " << data.max << "\n"
-                << "\tAvg: " << data.mean << "\n";
+      std::cout << station << "=" << data.min << "/" << data.max << "/" << data.sum / static_cast<float>(data.count);
+      if (i < station_map.size() - 1) std::cout << ", ";
+      ++i;
     }
-    std::cout << "Data size" << ": " << station_map.size() << std::endl;
+    std::cout << "}" << std::endl;
   } catch (const std::exception &e) {
     std::cerr << e.what() << std::endl;
     return 1;
