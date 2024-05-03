@@ -111,12 +111,9 @@ void process_line(const std::string &line) {
   it.sum += temperature;
 }
 
-void dispatch_rows(const std::string &path) {
-  MappedFile file(path);
-  const char *data = static_cast<const char *>(file.data());
-
+void dispatch_rows(const char *data, const size_t size) {
   size_t start = 0;
-  for (size_t i = 0; i < file.size(); ++i) {
+  for (size_t i = 0; i < size; ++i) {
     if (data[i] == '\n') {
       std::string line(data + start, i - start);
       pool.enqueue([line] { process_line(line); });
@@ -125,8 +122,8 @@ void dispatch_rows(const std::string &path) {
   }
 
   // Handle the last substring
-  if (start < file.size()) {
-    std::string line(data + start, file.size() - start);
+  if (start < size) {
+    std::string line(data + start, size - start);
     pool.enqueue([line] { process_line(line); });
   }
 }
@@ -152,20 +149,23 @@ int main(int argc, char *argv[]) {
   station_map.reserve(10000);
 
   try {
-    dispatch_rows(argv[1]);
-    pool.wait_until_empty();
-
-    std::cout << std::fixed << std::setprecision(2) << "{";
-    size_t i = 0;
-    for (const auto &[station, data] : station_map) {
-      std::cout << station << "=" << data.min << "/" << data.max << "/" << data.sum / static_cast<float>(data.count);
-      if (i < station_map.size() - 1) std::cout << ", ";
-      ++i;
-    }
-    std::cout << "}" << std::endl;
+    MappedFile file(argv[1]);
+    dispatch_rows(reinterpret_cast<const char *>(file.data()), file.size());
   } catch (const std::exception &e) {
     std::cerr << e.what() << std::endl;
     return 1;
   }
+
+  pool.wait_until_empty();
+
+  std::cout << std::fixed << std::setprecision(2) << "{";
+  size_t i = 0;
+  for (const auto &[station, data] : station_map) {
+    std::cout << station << "=" << data.min << "/" << data.max << "/" << data.sum / static_cast<float>(data.count);
+    if (i < station_map.size() - 1) std::cout << ", ";
+    ++i;
+  }
+  std::cout << "}" << std::endl;
+
   return 0;
 }
