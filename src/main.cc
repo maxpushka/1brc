@@ -1,4 +1,3 @@
-#include <arm_neon.h>
 #include <iostream>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -10,6 +9,9 @@
 #include <thread>
 #include <condition_variable>
 
+#include "thread_pool.h"
+
+namespace {
 class MappedFile {
   int fd = -1;
   void *addr = nullptr;
@@ -68,37 +70,74 @@ class MappedFile {
   [[nodiscard]] size_t size() const &{ return fileSize; }
 };
 
-static uint16_t neon_movemask(uint8x16_t input) {
-  const uint8_t __attribute__((aligned(16)))
-      mask_data[16] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
-  uint8x16_t mask = vld1q_u8(mask_data);
-  uint8x16_t masked = vandq_u8(input, mask);
-  uint8x16_t tmp = vpaddq_u8(masked, masked);
-  tmp = vpaddq_u8(tmp, tmp);
-  tmp = vpaddq_u8(tmp, tmp);
-  return vgetq_lane_u16(vreinterpretq_u16_u8(tmp), 0);
-}
+struct StationData {
+  float min = std::numeric_limits<float>::max();
+  float max = std::numeric_limits<float>::min();
+  uint count = 0;
+  float mean = 0;
+};
 
-std::queue<std::string> data_queue;
-std::mutex queue_mutex;
-std::condition_variable queue_cv;
-bool done = false;
+thread_pool::ThreadPool pool(std::thread::hardware_concurrency());
+std::mutex mtx;
+std::unordered_map<std::string, StationData> station_map;
 
-void process_data() {
-  std::unique_lock<std::mutex> lock(queue_mutex);
-  while (!done || !data_queue.empty()) {
-    if (!data_queue.empty()) {
-      std::string data = data_queue.front();
-      data_queue.pop();
-      lock.unlock();
-//      std::cout << "Processing: " << data << std::endl;
-      lock.lock();
-    } else {
-      queue_cv.wait(lock);
-    }
+void process_line(const std::string &line) {
+  if (line.empty() || line[0] == '#') return;  // Skip empty lines and comments
+
+  size_t pos = line.find(';'); // Each entry follows
+  if (pos == std::string::npos) return; // Missing ';' in the line, invalid format
+
+  std::string station = line.substr(0, pos);
+  float temperature = std::stof(line.substr(pos + 1));
+
+  std::lock_guard<std::mutex> lock(mtx);
+
+  auto it = station_map.find(station);
+  if (it != station_map.end()) {
+    it->second.min = std::min(it->second.min, temperature);
+    it->second.max = std::max(it->second.max, temperature);
+    it->second.count++;
+    it->second.mean = (temperature - it->second.mean) / static_cast<float>(it->second.count);
+  } else {
+    // Insert a new station
+    StationData new_station_data = {
+        .min = temperature,
+        .max = temperature,
+        .count = 1,
+        .mean = temperature
+    };
+    station_map.emplace(station, new_station_data);
   }
 }
 
+void dispatch_rows(const char *data, size_t size) {
+  size_t start = 0;
+  for (size_t i = 0; i < size; ++i) {
+    if (data[i] == '\n') {
+      std::string line(data + start, i - start);
+      pool.enqueue([line] { process_line(line); });
+      start = i + 1;
+    }
+  }
+
+  // Handle the last substring
+  if (start < size) {
+    std::string line(data + start, size - start);
+    pool.enqueue([line] { process_line(line); });
+  }
+}
+}
+
+/*
+ * TODO: potential improvements:
+ *   - Use SIMD to search for '\n' in the data buffer
+ *   - Pass `dispatch_rows` the start and end index of the data entry buffer instead of the entire buffer
+ *   - Reduce contention
+ *     - Use lock per station
+ *     - Use a lock-free data structure to store the station data
+ *   - Implement perfect hash function for station names to speed up lookups. Each station name is no longer than 100 bytes
+ *   - Execute reduce operation on the station data in parallel. Use streaming.
+ */
 int main(int argc, char *argv[]) {
   if (argc != 2) {
     std::cerr << "Error: provide absolute path to dataset" << std::endl;
@@ -107,38 +146,16 @@ int main(int argc, char *argv[]) {
 
   try {
     MappedFile file(argv[1]);
-    auto data = reinterpret_cast<uint8_t *>(file.data());
-    size_t start = 0;
+    dispatch_rows(reinterpret_cast<char *>(file.data()), file.size());
+    pool.wait_until_empty();
 
-    for (size_t i = 0; i < file.size(); i += 16) {
-      uint8x16_t chunk = vld1q_u8(&data[i]);
-      uint8x16_t result = vceqq_u8(chunk, vdupq_n_u8('\n'));
-      uint16_t mask = neon_movemask(result);
-
-      for (int j = 0; j < 16; ++j) {
-        if (mask & (1 << j)) {
-          size_t length = i + j - start;
-          std::string line(reinterpret_cast<char *>(&data[start]), length);
-          {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            data_queue.push(line);
-          }
-          start = i + j + 1;
-        }
-      }
+    for (const auto &[station, data] : station_map) {
+      std::cout << station << ": " << "\n"
+                << "\tMin: " << data.min << "\n"
+                << "\tMax: " << data.max << "\n"
+                << "\tAvg: " << data.mean << "\n";
     }
-
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex);
-      done = true;
-      std::cout << "Queue size: " << data_queue.size() << std::endl;
-    }
-    queue_cv.notify_all();
-
-    std::thread worker(process_data);
-    worker.join();
-
-    std::cout << "Queue processing completed." << std::endl;
+    std::cout << "Data size" << ": " << station_map.size() << std::endl;
   } catch (const std::exception &e) {
     std::cerr << e.what() << std::endl;
     return 1;
