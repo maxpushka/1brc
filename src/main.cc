@@ -7,13 +7,14 @@
 #include <unistd.h>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <iomanip>
+#include <vector>
 
 #include <immintrin.h>
 #include <emmintrin.h>
 #include <smmintrin.h>
-#include <vector>
 
 #include "thread_pool.h"
 
@@ -140,121 +141,67 @@ std::vector<std::string_view> split_by_rows_naive(const char *data, const size_t
   return result;
 }
 
-std::vector<std::string_view> split_by_rows_sse2(const char *data, size_t size) {
-  std::vector<std::string_view> result;
-  const char *start = data;
-  __m128i newline = _mm_set1_epi8('\n');
+// Define macros for SIMD operations based on compiler flags
+#if defined(__AVX512F__)
+    #define SIMD_TYPE __m512i
+    #define SET_NEWLINE _mm512_set1_epi8
+    #define LOAD_SI _mm512_loadu_si512
+    #define MOVE_MASK(block, newline) _mm512_cmpeq_epi8_mask(block, newline)
+    #define SIMD_TZCNT _tzcnt_u64
+    #define SIMD_WIDTH 64
+#elif defined(__AVX2__)
+    #define SIMD_TYPE __m256i
+    #define SET_NEWLINE _mm256_set1_epi8
+    #define LOAD_SI _mm256_loadu_si256
+    #define MOVE_MASK(block, newline) _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline))
+    #define SIMD_TZCNT _tzcnt_u32
+    #define SIMD_WIDTH 32
+#else  // Default to SSE2
+    #define SIMD_TYPE __m128i
+    #define SET_NEWLINE _mm_set1_epi8
+    #define LOAD_SI _mm_loadu_si128
+    #define MOVE_MASK(block, newline) _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline))
+    #define SIMD_TZCNT _tzcnt_u32
+    #define SIMD_WIDTH 16
+#endif
 
-  // Process 16 bytes at a time
-  while (size >= 16) {
-    __m128i block = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data));
-    int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline));
+std::vector<std::string_view> split_by_rows(const char *data, size_t size) {
+    std::vector<std::string_view> result;
+    const char *start = data;
+    SIMD_TYPE newline = SET_NEWLINE('\n');
 
-    while (mask != 0) {
-      int bit = _tzcnt_u32(mask); // Find the first set bit
-      result.emplace_back(start, data + bit); // Create a string from start to the newline
-      start = data + bit + 1; // Move start to after the newline
-      mask &= mask - 1; // Clear the lowest set bit
+    // Process data in chunks of SIMD_WIDTH
+    while (size >= SIMD_WIDTH) {
+        SIMD_TYPE block = LOAD_SI(reinterpret_cast<const SIMD_TYPE *>(data));
+        auto mask = MOVE_MASK(block, newline);
+
+        while (mask != 0) {
+            int bit = SIMD_TZCNT(mask);
+            result.emplace_back(start, data + bit);
+            start = data + bit + 1;
+            mask &= mask - 1;  // Clear the lowest set bit
+        }
+
+        data += SIMD_WIDTH;
+        size -= SIMD_WIDTH;
     }
 
-    data += 16;
-    size -= 16;
-  }
-
-  // Handle any remaining characters
-  while (size > 0) {
-    if (*data == '\n') {
-      result.emplace_back(start, data);
-      start = data + 1;
-    }
-    data++;
-    size--;
-  }
-
-  // Add the last piece if there's no newline at the end
-  if (start != data) {
-    result.emplace_back(start, data);
-  }
-
-  return result;
-}
-
-std::vector<std::string_view> split_by_rows_avx2(const char *data, size_t size) {
-  std::vector<std::string_view> result;
-  const char *start = data;
-  __m256i newline = _mm256_set1_epi8('\n');
-
-  // Process 32 bytes at a time
-  while (size >= 32) {
-    __m256i block = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data));
-    int mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline));
-
-    while (mask != 0) {
-      int bit = _tzcnt_u32(mask); // Find the first set bit
-      result.emplace_back(start, data + bit); // Create a string from start to the newline
-      start = data + bit + 1; // Move start to after the newline
-      mask &= mask - 1; // Clear the lowest set bit
+    // Handle any remaining characters
+    while (size > 0) {
+        if (*data == '\n') {
+            result.emplace_back(start, data);
+            start = data + 1;
+        }
+        data++;
+        size--;
     }
 
-    data += 32;
-    size -= 32;
-  }
-
-  // Handle any remaining characters
-  while (size > 0) {
-    if (*data == '\n') {
-      result.emplace_back(start, data);
-      start = data + 1;
-    }
-    data++;
-    size--;
-  }
-
-  // Add the last piece if there's no newline at the end
-  if (start != data) {
-    result.emplace_back(start, data);
-  }
-
-  return result;
-}
-
-std::vector<std::string_view> split_by_rows_avx512(const char *data, size_t size) {
-  std::vector<std::string_view> result;
-  const char *start = data;
-  __m512i newline = _mm512_set1_epi8('\n');
-
-  // Process 64 bytes at a time
-  while (size >= 64) {
-    __m512i block = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(data));
-    uint64_t mask = _mm512_cmpeq_epi8_mask(block, newline);
-
-    while (mask != 0) {
-      int bit = _tzcnt_u64(mask); // Find the first set bit
-      result.emplace_back(start, data + bit); // Create a string from start to the newline
-      start = data + bit + 1; // Move start to after the newline
-      mask &= mask - 1; // Clear the lowest set bit
+    // Add the last piece if there's no newline at the end
+    if (start != data) {
+        result.emplace_back(start, data);
     }
 
-    data += 64;
-    size -= 64;
-  }
-
-  // Handle any remaining characters
-  while (size > 0) {
-    if (*data == '\n') {
-      result.emplace_back(start, data);
-      start = data + 1;
-    }
-    data++;
-    size--;
-  }
-
-  // Add the last piece if there's no newline at the end
-  if (start != data) {
-    result.emplace_back(start, data);
-  }
-
-  return result;
+    return result;
 }
 }
 
@@ -284,10 +231,7 @@ int main(int argc, char *argv[]) {
   // Rehashing in concurrent environment can lead to SEGFAULT.
   station_map.reserve(10000);
 
-  // auto results = split_by_rows_naive(file.data(), file.size());
-  // auto results = split_by_rows_sse2(file.data(), file.size());
-  // auto results = split_by_rows_avx2(file.data(), file.size());
-  auto results = split_by_rows_avx512(file.data(), file.size());
+  auto results = split_by_rows(file.data(), file.size());
   std::cout << "AVX512 results: " << results.size() << std::endl << results.at(0) << std::endl;
 
   pool.wait_until_empty();
