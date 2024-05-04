@@ -1,3 +1,4 @@
+#include <charconv>
 #include <iostream>
 #include <memory>
 #include <sys/mman.h>
@@ -13,7 +14,6 @@
 #include <emmintrin.h>
 #include <smmintrin.h>
 #include <vector>
-#include <string>
 
 #include "thread_pool.h"
 
@@ -23,6 +23,8 @@ class MappedFile {
   void *addr = nullptr;
   size_t fileSize = 0;
  public:
+  MappedFile() = default;
+
   explicit MappedFile(const std::string &filename) {
     fd = open(filename.c_str(), O_RDONLY);
     if (fd == -1) {
@@ -60,7 +62,7 @@ class MappedFile {
   }
 
   MappedFile &operator=(MappedFile &&other) noexcept {
-    if (this != &other) return *this;
+    if (this == &other) return *this;
     addr = other.addr;
     fileSize = other.fileSize;
     fd = other.fd;
@@ -71,7 +73,9 @@ class MappedFile {
     return *this;
   }
 
-  [[nodiscard]] void *data() const &{ return addr; }
+  [[nodiscard]] const char *data() const &{
+    return reinterpret_cast<const char *>(addr);
+  }
 
   [[nodiscard]] size_t size() const &{ return fileSize; }
 };
@@ -87,20 +91,22 @@ struct StationData {
 };
 
 thread_pool::ThreadPool pool(std::thread::hardware_concurrency());
-std::unordered_map<std::string, StationData> station_map;
+std::unordered_map<std::string_view, StationData> station_map;
 std::mutex map_access_mutex;
 
-void process_line(const std::string &line) {
+void process_line(const std::string_view &line) {
   size_t pos = line.find(';');
   // No need to check for missing ';'
   // since the data is assumed to be well-formed
 
-  std::string station = line.substr(0, pos);
-  float temperature = std::stof(line.substr(pos + 1));
+  std::string_view station = line.substr(0, pos);
+  float temperature;
+  std::from_chars(line.data() + pos, line.data() + pos + 1, temperature);
+  // temperature = std::stof(line.substr(pos + 1));
 
-  if (station_map.find(station) == station_map.end()) {
+  if (!station_map.contains(station)) {
     std::lock_guard<std::mutex> lock(map_access_mutex);
-    if (station_map.find(station) == station_map.end()) {
+    if (!station_map.contains(station)) {
       station_map.insert({station, std::move(StationData(temperature))});
       return;
     }
@@ -117,7 +123,7 @@ void process_line(const std::string &line) {
 
 std::vector<std::string_view> split_by_rows_naive(const char *data, const size_t size) {
   std::vector<std::string_view> result;
-    
+
   size_t start = 0;
   for (size_t i = 0; i < size; ++i) {
     if (data[i] == '\n') {
@@ -134,49 +140,126 @@ std::vector<std::string_view> split_by_rows_naive(const char *data, const size_t
   return result;
 }
 
-std::vector<std::string_view> split_by_rows_sse2(const char* data, size_t size) {
-    std::vector<std::string_view> result;
-    const char* start = data;
-    __m128i newline = _mm_set1_epi8('\n');
-    
-    // Process 16 bytes at a time
-    while (size >= 16) {
-        __m128i block = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data));
-        int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline));
-        
-        while (mask != 0) {
-            int bit = _tzcnt_u32(mask); // Find the first set bit
-            result.emplace_back(start, data + bit); // Create a string from start to the newline
-            start = data + bit + 1; // Move start to after the newline
-            mask &= mask - 1; // Clear the lowest set bit
-        }
-        
-        data += 16;
-        size -= 16;
+std::vector<std::string_view> split_by_rows_sse2(const char *data, size_t size) {
+  std::vector<std::string_view> result;
+  const char *start = data;
+  __m128i newline = _mm_set1_epi8('\n');
+
+  // Process 16 bytes at a time
+  while (size >= 16) {
+    __m128i block = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data));
+    int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline));
+
+    while (mask != 0) {
+      int bit = _tzcnt_u32(mask); // Find the first set bit
+      result.emplace_back(start, data + bit); // Create a string from start to the newline
+      start = data + bit + 1; // Move start to after the newline
+      mask &= mask - 1; // Clear the lowest set bit
     }
-    
-    // Handle any remaining characters
-    while (size > 0) {
-        if (*data == '\n') {
-            result.emplace_back(start, data);
-            start = data + 1;
-        }
-        data++;
-        size--;
+
+    data += 16;
+    size -= 16;
+  }
+
+  // Handle any remaining characters
+  while (size > 0) {
+    if (*data == '\n') {
+      result.emplace_back(start, data);
+      start = data + 1;
     }
-    
-    // Add the last piece if there's no newline at the end
-    if (start != data) {
-        result.emplace_back(start, data);
+    data++;
+    size--;
+  }
+
+  // Add the last piece if there's no newline at the end
+  if (start != data) {
+    result.emplace_back(start, data);
+  }
+
+  return result;
+}
+
+std::vector<std::string_view> split_by_rows_avx2(const char *data, size_t size) {
+  std::vector<std::string_view> result;
+  const char *start = data;
+  __m256i newline = _mm256_set1_epi8('\n');
+
+  // Process 32 bytes at a time
+  while (size >= 32) {
+    __m256i block = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data));
+    int mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline));
+
+    while (mask != 0) {
+      int bit = _tzcnt_u32(mask); // Find the first set bit
+      result.emplace_back(start, data + bit); // Create a string from start to the newline
+      start = data + bit + 1; // Move start to after the newline
+      mask &= mask - 1; // Clear the lowest set bit
     }
-    
-    return result;
+
+    data += 32;
+    size -= 32;
+  }
+
+  // Handle any remaining characters
+  while (size > 0) {
+    if (*data == '\n') {
+      result.emplace_back(start, data);
+      start = data + 1;
+    }
+    data++;
+    size--;
+  }
+
+  // Add the last piece if there's no newline at the end
+  if (start != data) {
+    result.emplace_back(start, data);
+  }
+
+  return result;
+}
+
+std::vector<std::string_view> split_by_rows_avx512(const char *data, size_t size) {
+  std::vector<std::string_view> result;
+  const char *start = data;
+  __m512i newline = _mm512_set1_epi8('\n');
+
+  // Process 64 bytes at a time
+  while (size >= 64) {
+    __m512i block = _mm512_loadu_si512(reinterpret_cast<const __m512i *>(data));
+    uint64_t mask = _mm512_cmpeq_epi8_mask(block, newline);
+
+    while (mask != 0) {
+      int bit = _tzcnt_u64(mask); // Find the first set bit
+      result.emplace_back(start, data + bit); // Create a string from start to the newline
+      start = data + bit + 1; // Move start to after the newline
+      mask &= mask - 1; // Clear the lowest set bit
+    }
+
+    data += 64;
+    size -= 64;
+  }
+
+  // Handle any remaining characters
+  while (size > 0) {
+    if (*data == '\n') {
+      result.emplace_back(start, data);
+      start = data + 1;
+    }
+    data++;
+    size--;
+  }
+
+  // Add the last piece if there's no newline at the end
+  if (start != data) {
+    result.emplace_back(start, data);
+  }
+
+  return result;
 }
 }
 
 /*
  * TODO: potential improvements:
- *   - Use SIMD to search for '\n' in the data buffer
  *   - Pass `dispatch_rows` the start and end index of the data entry buffer instead of the entire buffer
  *   - Reduce contention
  *     - Use a lock-free data structure to store the station data
@@ -189,19 +272,23 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Reserve space for the map to avoid rehashing.
-  // Rehashing in concurrent environment can lead to SEGFAULT.
-  station_map.reserve(10000);
-
+  MappedFile file;
   try {
-    MappedFile file(argv[1]);
-    // auto results = split_by_rows_naive(reinterpret_cast<const char *>(file.data()), file.size());
-    auto results = split_by_rows_sse2(reinterpret_cast<const char *>(file.data()), file.size());
-    std::cout << "SSE2 results: " << results.size() << std::endl << results.at(0) << std::endl;
+    file = MappedFile{argv[1]};
   } catch (const std::exception &e) {
     std::cerr << e.what() << std::endl;
     return 1;
   }
+
+  // Reserve space for the map to avoid rehashing.
+  // Rehashing in concurrent environment can lead to SEGFAULT.
+  station_map.reserve(10000);
+
+  // auto results = split_by_rows_naive(file.data(), file.size());
+  // auto results = split_by_rows_sse2(file.data(), file.size());
+  // auto results = split_by_rows_avx2(file.data(), file.size());
+  auto results = split_by_rows_avx512(file.data(), file.size());
+  std::cout << "AVX512 results: " << results.size() << std::endl << results.at(0) << std::endl;
 
   pool.wait_until_empty();
 
