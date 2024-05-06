@@ -88,7 +88,7 @@ struct StationData {
   float sum = 0;
   std::shared_ptr<std::mutex> mtx = std::make_shared<std::mutex>();
 
-  StationData(float temperature) : min(temperature), max(temperature), count(1), sum(temperature) {}
+  explicit StationData(float temperature) : min(temperature), max(temperature), count(1), sum(temperature) {}
 };
 
 thread_pool::ThreadPool pool(std::thread::hardware_concurrency());
@@ -101,9 +101,14 @@ void process_line(const std::string_view &line) {
   // since the data is assumed to be well-formed
 
   std::string_view station = line.substr(0, pos);
-  float temperature;
-  std::from_chars(line.data() + pos, line.data() + pos + 1, temperature);
-  // temperature = std::stof(line.substr(pos + 1));
+  std::string_view measurement = line.substr(pos + 1);
+  float temperature = 0.0f;
+  auto
+      [_, ec] = std::from_chars(measurement.data(), measurement.data() + measurement.size(), temperature);
+  if (ec != std::errc()) {
+    std::cerr << "Error: failed to parse temperature" << std::endl;
+    return;
+  }
 
   if (!station_map.contains(station)) {
     std::lock_guard<std::mutex> lock(map_access_mutex);
@@ -122,7 +127,8 @@ void process_line(const std::string_view &line) {
   it.sum += temperature;
 }
 
-std::vector<std::string_view> split_by_rows_naive(const char *data, const size_t size) {
+#if defined(USE_NAIVE)
+std::vector<std::string_view> split_by_rows(const char *data, const size_t size) {
   std::vector<std::string_view> result;
 
   size_t start = 0;
@@ -140,69 +146,70 @@ std::vector<std::string_view> split_by_rows_naive(const char *data, const size_t
 
   return result;
 }
-
-// Define macros for SIMD operations based on compiler flags
-#if defined(__AVX512F__)
-    #define SIMD_TYPE __m512i
-    #define SET_NEWLINE _mm512_set1_epi8
-    #define LOAD_SI _mm512_loadu_si512
-    #define MOVE_MASK(block, newline) _mm512_cmpeq_epi8_mask(block, newline)
-    #define SIMD_TZCNT _tzcnt_u64
-    #define SIMD_WIDTH 64
-#elif defined(__AVX2__)
-    #define SIMD_TYPE __m256i
-    #define SET_NEWLINE _mm256_set1_epi8
-    #define LOAD_SI _mm256_loadu_si256
-    #define MOVE_MASK(block, newline) _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline))
-    #define SIMD_TZCNT _tzcnt_u32
-    #define SIMD_WIDTH 32
-#else  // Default to SSE2
-    #define SIMD_TYPE __m128i
-    #define SET_NEWLINE _mm_set1_epi8
-    #define LOAD_SI _mm_loadu_si128
-    #define MOVE_MASK(block, newline) _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline))
-    #define SIMD_TZCNT _tzcnt_u32
-    #define SIMD_WIDTH 16
+#else
+// Macros definitions for SIMD operations based on compiler flags
+#if defined(USE_AVX512)
+#define SIMD_TYPE __m512i
+#define SET_NEWLINE _mm512_set1_epi8
+#define LOAD_SI _mm512_loadu_si512
+#define MOVE_MASK(block, newline) _mm512_cmpeq_epi8_mask(block, newline)
+#define SIMD_TZCNT _tzcnt_u64
+#define SIMD_WIDTH 64
+#elif defined(USE_AVX2)
+#define SIMD_TYPE __m256i
+#define SET_NEWLINE _mm256_set1_epi8
+#define LOAD_SI _mm256_loadu_si256
+#define MOVE_MASK(block, newline) _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline))
+#define SIMD_TZCNT _tzcnt_u32
+#define SIMD_WIDTH 32
+#elif defined(USE_SSE2)
+#define SIMD_TYPE __m128i
+#define SET_NEWLINE _mm_set1_epi8
+#define LOAD_SI _mm_loadu_si128
+#define MOVE_MASK(block, newline) _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline))
+#define SIMD_TZCNT _tzcnt_u32
+#define SIMD_WIDTH 16
 #endif
 
 std::vector<std::string_view> split_by_rows(const char *data, size_t size) {
-    std::vector<std::string_view> result;
-    const char *start = data;
-    SIMD_TYPE newline = SET_NEWLINE('\n');
+  std::vector<std::string_view> result;
+  const char *start = data;
+  SIMD_TYPE newline = SET_NEWLINE('\n');
 
-    // Process data in chunks of SIMD_WIDTH
-    while (size >= SIMD_WIDTH) {
-        SIMD_TYPE block = LOAD_SI(reinterpret_cast<const SIMD_TYPE *>(data));
-        auto mask = MOVE_MASK(block, newline);
+  // Process data in chunks of SIMD_WIDTH
+  while (size >= SIMD_WIDTH) {
+    SIMD_TYPE block = LOAD_SI(reinterpret_cast<const SIMD_TYPE *>(data));
+    auto mask = MOVE_MASK(block, newline);
 
-        while (mask != 0) {
-            int bit = SIMD_TZCNT(mask);
-            result.emplace_back(start, data + bit);
-            start = data + bit + 1;
-            mask &= mask - 1;  // Clear the lowest set bit
-        }
-
-        data += SIMD_WIDTH;
-        size -= SIMD_WIDTH;
+    while (mask != 0) {
+      int bit = SIMD_TZCNT(mask);
+      result.emplace_back(start, data + bit);
+      start = data + bit + 1;
+      mask &= mask - 1;  // Clear the lowest set bit
     }
 
-    // Handle any remaining characters
-    while (size > 0) {
-        if (*data == '\n') {
-            result.emplace_back(start, data);
-            start = data + 1;
-        }
-        data++;
-        size--;
-    }
+    data += SIMD_WIDTH;
+    size -= SIMD_WIDTH;
+  }
 
-    // Add the last piece if there's no newline at the end
-    if (start != data) {
-        result.emplace_back(start, data);
+  // Handle any remaining characters
+  while (size > 0) {
+    if (*data == '\n') {
+      result.emplace_back(start, data);
+      start = data + 1;
     }
+    data++;
+    size--;
+  }
 
-    return result;
+  // Add the last piece if there's no newline at the end
+  if (start != data) {
+    result.emplace_back(start, data);
+  }
+
+  return result;
 }
+#endif
 }
 
 /*
@@ -231,13 +238,14 @@ int main(int argc, char *argv[]) {
   // Rehashing in concurrent environment can lead to SEGFAULT.
   station_map.reserve(10000);
 
-  auto results = split_by_rows(file.data(), file.size());
-  std::cout << "AVX512 results: " << results.size() << std::endl << results.at(0) << std::endl;
-
+  auto rows = split_by_rows(file.data(), file.size());
+  for (const auto &row : rows) {
+    pool.enqueue([row] { return process_line(row); });
+  }
   pool.wait_until_empty();
 
   size_t i = 0;
-  std::cout << std::fixed << std::setprecision(2) << "{";
+  std::cout << std::fixed << std::setprecision(1) << "{";
   for (const auto &[station, data] : station_map) {
     std::cout << station << "=" << data.min << "/" << data.max << "/" << data.sum / static_cast<float>(data.count);
     if (i < station_map.size() - 1) std::cout << ", ";
