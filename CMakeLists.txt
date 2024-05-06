@@ -5,11 +5,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_CXX_STANDARD 23)
-add_executable(${PROJECT_NAME}
-        src/main.cc
-        src/thread_pool.h
-)
 
+add_executable(${PROJECT_NAME} src/main.cc)
+
+# Enable Link Time Optimizations
 include(CheckIPOSupported)
 check_ipo_supported(RESULT supported OUTPUT error)
 if (supported)
@@ -19,7 +18,7 @@ else ()
     message(WARNING "IPO / LTO not supported: <${error}>")
 endif ()
 
-# Enable SSE2 instructions
+# Use SIMD instructions if available
 include(CheckCXXCompilerFlag)
 CHECK_CXX_COMPILER_FLAG("-mavx512f -mavx512bw" COMPILER_SUPPORTS_AVX512BW)
 CHECK_CXX_COMPILER_FLAG("-mavx2" COMPILER_SUPPORTS_AVX2)

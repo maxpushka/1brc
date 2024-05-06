@@ -5,19 +5,17 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <iomanip>
 #include <vector>
+#include <algorithm>
+#include <execution>
+#include <print>
 
 #include <immintrin.h>
 #include <emmintrin.h>
 #include <smmintrin.h>
-
-#include "thread_pool.h"
 
 constexpr size_t UNIQUE_NAMES = 10000;
 
@@ -231,8 +229,6 @@ std::vector<std::string_view> split_by_rows(const char *data, size_t size) {
 #endif
 }
 
-thread_pool::ThreadPool pool(std::thread::hardware_concurrency());
-
 int main(int argc, char *argv[]) {
   if (argc != 2) {
     std::cerr << "Error: provide absolute path to dataset" << std::endl;
@@ -248,10 +244,10 @@ int main(int argc, char *argv[]) {
   }
 
   auto rows = split_by_rows(file.data(), file.size());
-  for (const auto &row : rows) {
-    pool.enqueue([row] { process_line(row); });
-  }
-  pool.wait_until_empty();
+  std::println("Finished parsing file");
+  std::for_each(std::execution::par_unseq, rows.begin(), rows.end(), [](std::string_view row) {
+    process_line(row);
+  });
 
   std::cout << std::fixed << std::setprecision(1) << "{";
   for (size_t i = 0; const auto &station : stations) {
