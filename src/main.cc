@@ -1,6 +1,7 @@
+#include <atomic>
 #include <charconv>
 #include <iostream>
-#include <memory>
+#include <limits>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -17,6 +18,8 @@
 #include <smmintrin.h>
 
 #include "thread_pool.h"
+
+constexpr size_t UNIQUE_NAMES = 10000;
 
 namespace {
 class MappedFile {
@@ -82,18 +85,29 @@ class MappedFile {
 };
 
 struct StationData {
-  float min = std::numeric_limits<float>::max();
-  float max = std::numeric_limits<float>::min();
-  uint count = 0;
-  float sum = 0;
-  std::shared_ptr<std::mutex> mtx = std::make_shared<std::mutex>();
+  std::atomic<float> min = std::numeric_limits<float>::max();
+  std::atomic<float> max = std::numeric_limits<float>::min();
+  std::atomic<uint> count = 0;
+  std::atomic<float> sum = 0;
 
-  explicit StationData(float temperature) : min(temperature), max(temperature), count(1), sum(temperature) {}
+  std::atomic<int> index = -1;
+  std::string_view name;
+  std::mutex name_mutex;
+
+  void set_name(const std::string_view& station, const size_t station_index) {
+    // Early check to reduce locking overhead
+    if (index.load(std::memory_order_acquire) != -1) return;
+
+    std::lock_guard<std::mutex> lock(name_mutex);
+    // Confirm the condition hasn't changed after acquiring the lock
+    if (index.load(std::memory_order_relaxed) != -1) return;
+
+    name = station;
+    index.store(station_index, std::memory_order_release);
+  }
 };
 
-thread_pool::ThreadPool pool(std::thread::hardware_concurrency());
-std::unordered_map<std::string_view, StationData> station_map;
-std::mutex map_access_mutex;
+std::array<StationData, UNIQUE_NAMES> stations{};
 
 void process_line(const std::string_view &line) {
   size_t pos = line.find(';');
@@ -101,30 +115,35 @@ void process_line(const std::string_view &line) {
   // since the data is assumed to be well-formed
 
   std::string_view station = line.substr(0, pos);
+  size_t index = std::hash<std::string_view>{}(station) % UNIQUE_NAMES;
+
   std::string_view measurement = line.substr(pos + 1);
   float temperature = 0.0f;
   auto
       [_, ec] = std::from_chars(measurement.data(), measurement.data() + measurement.size(), temperature);
   if (ec != std::errc()) {
-    std::cerr << "Error: failed to parse temperature" << std::endl;
-    return;
+    std::cerr << "Error: failed to parse temperature (" << measurement << ')' << std::endl;
+    throw 1;
   }
 
-  if (!station_map.contains(station)) {
-    std::lock_guard<std::mutex> lock(map_access_mutex);
-    if (!station_map.contains(station)) {
-      station_map.insert({station, std::move(StationData(temperature))});
-      return;
-    }
+  StationData &it = stations.at(index);
+
+  float prevMin = it.min.load();
+  while (temperature < prevMin) {
+    if (it.min.compare_exchange_weak(prevMin, temperature)) break;
+    prevMin = it.min.load();
   }
 
-  std::lock_guard<std::mutex> lock(*station_map.at(station).mtx);
+  float prevMax = it.max.load();
+  while (temperature > prevMax) {
+    if (it.max.compare_exchange_weak(prevMax, temperature)) break;
+    prevMax = it.max.load();
+  }
 
-  StationData &it = station_map.at(station);
-  it.min = std::min(it.min, temperature);
-  it.max = std::max(it.max, temperature);
-  it.count++;
-  it.sum += temperature;
+  it.count.fetch_add(1);
+  it.sum.fetch_add(temperature);
+
+  it.set_name(std::move(station), index);
 }
 
 #if defined(USE_NAIVE)
@@ -212,14 +231,8 @@ std::vector<std::string_view> split_by_rows(const char *data, size_t size) {
 #endif
 }
 
-/*
- * TODO: potential improvements:
- *   - Pass `dispatch_rows` the start and end index of the data entry buffer instead of the entire buffer
- *   - Reduce contention
- *     - Use a lock-free data structure to store the station data
- *   - Implement perfect hash function for station names to speed up lookups. Each station name is no longer than 100 bytes
- *   - Execute reduce operation on the station data in parallel. Use streaming.
- */
+thread_pool::ThreadPool pool(std::thread::hardware_concurrency());
+
 int main(int argc, char *argv[]) {
   if (argc != 2) {
     std::cerr << "Error: provide absolute path to dataset" << std::endl;
@@ -234,21 +247,21 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Reserve space for the map to avoid rehashing.
-  // Rehashing in concurrent environment can lead to SEGFAULT.
-  station_map.reserve(10000);
-
   auto rows = split_by_rows(file.data(), file.size());
   for (const auto &row : rows) {
-    pool.enqueue([row] { return process_line(row); });
+    pool.enqueue([row] { process_line(row); });
   }
   pool.wait_until_empty();
 
-  size_t i = 0;
   std::cout << std::fixed << std::setprecision(1) << "{";
-  for (const auto &[station, data] : station_map) {
-    std::cout << station << "=" << data.min << "/" << data.max << "/" << data.sum / static_cast<float>(data.count);
-    if (i < station_map.size() - 1) std::cout << ", ";
+  for (size_t i = 0; const auto &station : stations) {
+    if (station.count == 0) continue;
+
+    if (i != 0) std::cout << ", ";
+    std::cout << station.name << '='  // '(' << station.index << ")="
+      << station.min << '/'
+      << station.max << '/'
+      << station.sum / static_cast<float>(station.count);
     ++i;
   }
   std::cout << "}" << std::endl;
