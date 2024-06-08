@@ -1,17 +1,17 @@
+#include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <execution>
+#include <fcntl.h>
+#include <iomanip>
 #include <iostream>
 #include <limits>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
+#include <print>
 #include <string>
 #include <string_view>
-#include <iomanip>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <vector>
-#include <algorithm>
-#include <execution>
-#include <print>
 
 constexpr size_t UNIQUE_NAMES = 10000;
 
@@ -20,7 +20,8 @@ class MappedFile {
   int fd = -1;
   void *addr = nullptr;
   size_t fileSize = 0;
- public:
+
+public:
   MappedFile() = default;
 
   explicit MappedFile(const std::string &filename) {
@@ -46,21 +47,25 @@ class MappedFile {
   }
 
   ~MappedFile() {
-    if (addr) munmap(addr, fileSize);
-    if (fd != -1) close(fd);
+    if (addr)
+      munmap(addr, fileSize);
+    if (fd != -1)
+      close(fd);
   }
 
   MappedFile(const MappedFile &) = delete;
   MappedFile &operator=(const MappedFile &) = delete;
 
-  MappedFile(MappedFile &&other) noexcept: fd(other.fd), addr(other.addr), fileSize(other.fileSize) {
+  MappedFile(MappedFile &&other) noexcept
+      : fd(other.fd), addr(other.addr), fileSize(other.fileSize) {
     other.addr = nullptr;
     other.fd = -1;
     other.fileSize = 0;
   }
 
   MappedFile &operator=(MappedFile &&other) noexcept {
-    if (this == &other) return *this;
+    if (this == &other)
+      return *this;
     addr = other.addr;
     fileSize = other.fileSize;
     fd = other.fd;
@@ -71,11 +76,11 @@ class MappedFile {
     return *this;
   }
 
-  [[nodiscard]] const char *data() const &{
+  [[nodiscard]] const char *data() const & {
     return reinterpret_cast<const char *>(addr);
   }
 
-  [[nodiscard]] size_t size() const &{ return fileSize; }
+  [[nodiscard]] size_t size() const & { return fileSize; }
 };
 
 struct StationData {
@@ -88,13 +93,15 @@ struct StationData {
   std::string_view name;
   std::mutex name_mutex;
 
-  void set_name(const std::string_view& station, const size_t station_index) {
+  void set_name(const std::string_view &station, const size_t station_index) {
     // Early check to reduce locking overhead
-    if (index.load(std::memory_order_acquire) != -1) return;
+    if (index.load(std::memory_order_acquire) != -1)
+      return;
 
     std::lock_guard<std::mutex> lock(name_mutex);
     // Confirm the condition hasn't changed after acquiring the lock
-    if (index.load(std::memory_order_relaxed) != -1) return;
+    if (index.load(std::memory_order_relaxed) != -1)
+      return;
 
     name = station;
     index.store(station_index, std::memory_order_release);
@@ -113,10 +120,11 @@ void process_line(const std::string_view &line) {
 
   std::string_view measurement = line.substr(pos + 1);
   float temperature = 0.0f;
-  auto
-      [_, ec] = std::from_chars(measurement.data(), measurement.data() + measurement.size(), temperature);
+  auto [_, ec] = std::from_chars(
+      measurement.data(), measurement.data() + measurement.size(), temperature);
   if (ec != std::errc()) {
-    std::cerr << "Error: failed to parse temperature (" << measurement << ')' << std::endl;
+    std::cerr << "Error: failed to parse temperature (" << measurement << ')'
+              << std::endl;
     throw 1;
   }
 
@@ -124,13 +132,15 @@ void process_line(const std::string_view &line) {
 
   float prevMin = it.min.load();
   while (temperature < prevMin) {
-    if (it.min.compare_exchange_weak(prevMin, temperature)) break;
+    if (it.min.compare_exchange_weak(prevMin, temperature))
+      break;
     prevMin = it.min.load();
   }
 
   float prevMax = it.max.load();
   while (temperature > prevMax) {
-    if (it.max.compare_exchange_weak(prevMax, temperature)) break;
+    if (it.max.compare_exchange_weak(prevMax, temperature))
+      break;
     prevMax = it.max.load();
   }
 
@@ -141,12 +151,14 @@ void process_line(const std::string_view &line) {
 }
 
 #if defined(USE_NAIVE)
-std::vector<std::string_view> split_by_rows(const char *data, const size_t size) {
+std::vector<std::string_view> split_by_rows(const char *data,
+                                            const size_t size) {
   std::vector<std::string_view> result;
 
   size_t start = 0;
   for (size_t i = 0; i < size; ++i) {
-    if (data[i] != '\n') continue;
+    if (data[i] != '\n')
+      continue;
     result.emplace_back(data + start, i - start);
     start = i + 1;
   }
@@ -159,8 +171,8 @@ std::vector<std::string_view> split_by_rows(const char *data, const size_t size)
   return result;
 }
 #else
-#include <immintrin.h>
 #include <emmintrin.h>
+#include <immintrin.h>
 #include <smmintrin.h>
 // Macros definitions for SIMD operations based on compiler flags
 #if defined(USE_AVX512)
@@ -174,14 +186,16 @@ std::vector<std::string_view> split_by_rows(const char *data, const size_t size)
 #define SIMD_TYPE __m256i
 #define SET_NEWLINE _mm256_set1_epi8
 #define LOAD_SI _mm256_loadu_si256
-#define MOVE_MASK(block, newline) _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline))
+#define MOVE_MASK(block, newline)                                              \
+  _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, newline))
 #define SIMD_TZCNT _tzcnt_u32
 #define SIMD_WIDTH 32
 #elif defined(USE_SSE2)
 #define SIMD_TYPE __m128i
 #define SET_NEWLINE _mm_set1_epi8
 #define LOAD_SI _mm_loadu_si128
-#define MOVE_MASK(block, newline) _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline))
+#define MOVE_MASK(block, newline)                                              \
+  _mm_movemask_epi8(_mm_cmpeq_epi8(block, newline))
 #define SIMD_TZCNT _tzcnt_u32
 #define SIMD_WIDTH 16
 #endif
@@ -200,7 +214,7 @@ std::vector<std::string_view> split_by_rows(const char *data, size_t size) {
       int bit = SIMD_TZCNT(mask);
       result.emplace_back(start, data + bit);
       start = data + bit + 1;
-      mask &= mask - 1;  // Clear the lowest set bit
+      mask &= mask - 1; // Clear the lowest set bit
     }
 
     data += SIMD_WIDTH;
@@ -225,7 +239,7 @@ std::vector<std::string_view> split_by_rows(const char *data, size_t size) {
   return result;
 }
 #endif
-}
+} // namespace
 
 int main(int argc, char *argv[]) {
   if (argc != 2) {
@@ -243,19 +257,19 @@ int main(int argc, char *argv[]) {
 
   auto rows = split_by_rows(file.data(), file.size());
   std::println("Finished parsing file");
-  std::for_each(std::execution::par_unseq, rows.begin(), rows.end(), [](std::string_view row) {
-    process_line(row);
-  });
+  std::for_each(std::execution::par_unseq, rows.begin(), rows.end(),
+                [](std::string_view row) { process_line(row); });
 
   std::cout << std::fixed << std::setprecision(1) << "{";
   for (size_t i = 0; const auto &station : stations) {
-    if (station.count == 0) continue;
+    if (station.count == 0)
+      continue;
 
-    if (i != 0) std::cout << ", ";
-    std::cout << station.name << '='  // '(' << station.index << ")="
-      << station.min << '/'
-      << station.max << '/'
-      << station.sum / static_cast<float>(station.count);
+    if (i != 0)
+      std::cout << ", ";
+    std::cout << station.name << '=' // '(' << station.index << ")="
+              << station.min << '/' << station.max << '/'
+              << station.sum / static_cast<float>(station.count);
     ++i;
   }
   std::cout << "}" << std::endl;
