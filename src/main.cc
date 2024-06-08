@@ -13,10 +13,6 @@
 #include <execution>
 #include <print>
 
-#include <immintrin.h>
-#include <emmintrin.h>
-#include <smmintrin.h>
-
 constexpr size_t UNIQUE_NAMES = 10000;
 
 namespace {
@@ -150,10 +146,9 @@ std::vector<std::string_view> split_by_rows(const char *data, const size_t size)
 
   size_t start = 0;
   for (size_t i = 0; i < size; ++i) {
-    if (data[i] == '\n') {
-      result.emplace_back(data + start, i - start);
-      start = i + 1;
-    }
+    if (data[i] != '\n') continue;
+    result.emplace_back(data + start, i - start);
+    start = i + 1;
   }
 
   // Handle the last substring
@@ -164,6 +159,9 @@ std::vector<std::string_view> split_by_rows(const char *data, const size_t size)
   return result;
 }
 #else
+#include <immintrin.h>
+#include <emmintrin.h>
+#include <smmintrin.h>
 // Macros definitions for SIMD operations based on compiler flags
 #if defined(USE_AVX512)
 #define SIMD_TYPE __m512i
